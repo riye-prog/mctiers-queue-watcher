@@ -30,6 +30,8 @@
 
 3. Open your MCTiers queue channel. Choose **Arm preview** to test detection, or switch to **Live** and choose **Arm for an opening**. **Try visible button now** sends one immediate click. **Disarm** stops watching.
 
+   You can switch channels while armed if the panel says so. If it says to keep the channel open, leave the queue channel open.
+
 <details>
 <summary>Manual Windows setup</summary>
 

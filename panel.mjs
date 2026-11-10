@@ -1,6 +1,11 @@
 export function showQueuePanel(watchQueue) {
   const panelId = 'mctiers-queue-control';
-  if (document.getElementById(panelId)) return 'Queue panel is already open in Discord.';
+  const existing = document.getElementById(panelId);
+  if (existing?.dataset.version === '2') return 'Queue panel is already open in Discord.';
+  if (existing) {
+    globalThis.stopMctiersQueue?.();
+    existing.remove();
+  }
 
   function element(tag, attributes, text) {
     const node = document.createElement(tag);
@@ -9,7 +14,7 @@ export function showQueuePanel(watchQueue) {
     return node;
   }
 
-  const host = element('div', { id: panelId });
+  const host = element('div', { id: panelId, 'data-version': '2' });
   const root = host.attachShadow({ mode: 'open' });
   const styles = new CSSStyleSheet();
   styles.replaceSync(`
@@ -132,6 +137,7 @@ export function showQueuePanel(watchQueue) {
     }
 
     const live = liveMode();
+    const channelName = document.title.match(/^(#[^|]+)\|/)?.[1].trim() || 'the armed channel';
     armed = true;
     updateAction();
     report(live ? 'live' : 'armed', live ? 'Live armed' : 'Preview armed', 'Looking for the queue in this channel.');
@@ -140,18 +146,22 @@ export function showQueuePanel(watchQueue) {
     try {
       const result = await watchQueue({
         channel, live, tryVisible,
-        onWaiting(current) {
-          const message = current?.full && current.displayedCount
-            ? `${current.displayedCount} is full. Watching for a slot.`
-            : 'Watching this channel for the next opening.';
+        onWaiting(current, background) {
+          const status = current?.full && current.displayedCount ? `${current.displayedCount} is full. ` : '';
+          const message = status + (background
+            ? `Watching ${channelName}. You can switch channels.`
+            : 'Keep this channel open while watching.');
           report(live ? 'live' : 'armed', live ? 'Live armed' : 'Preview armed', message);
         }
       });
       if (typeof result.detectMs === 'number') {
         const timing = result.detectMs < 0.1 ? '<0.1' : result.detectMs.toFixed(1);
-        report('complete', live ? 'Click sent' : 'Opening detected', `${timing} ms local detection. ${live ? 'Check Discord for the queue reply.' : 'Preview complete.'}`);
+        const title = !live ? 'Opening detected' : result.source === 'incoming update' ? 'Join attempted' : 'Click sent';
+        report('complete', title, `${timing} ms local detection. ${live ? 'Check the armed channel for the queue reply.' : 'Preview complete.'}`);
       } else if (result.outcome === 'no enabled button') {
         report('idle', 'No join button', 'Open the MCTiers queue message and try again.');
+      } else if (result.outcome === 'join request failed') {
+        report('idle', 'Join failed', 'Check Discord and arm again.');
       } else {
         report('idle', result.outcome === 'channel changed' ? 'Channel changed' : 'Disarmed', 'Arm again when you’re ready.');
       }

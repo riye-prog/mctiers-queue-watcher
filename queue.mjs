@@ -1,28 +1,33 @@
 import { pathToFileURL } from 'node:url';
+import { resolveDiscordTransport } from './discord-runtime.mjs';
 import { showQueuePanel } from './panel.mjs';
 
-export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
+export function watchQueue({ channel, live, tryVisible = false, onWaiting, resolveTransport }) {
   const startedAt = performance.now();
   const appId = '1124128173609713734';
   const listSelector = '[data-list-id="chat-messages"]';
   const rowSelector = '[id^="chat-messages-"]';
   const countPattern = /(?:^|[^a-z])Queue[^a-z\d]*\((\d+)\s*\/\s*(\d+)\)/i;
-  const channelId = channel.split('/')[3];
+  const [, , guildId, channelId] = channel.split('/');
   const firstNewId = BigInt(Date.now() - 1420070400000) << 22n;
   const seen = new Map();
+  const incoming = new Map();
   const identities = new WeakMap();
   const currentChannel = () => location.pathname.split('/').slice(0, 4).join('/');
   if (currentChannel() !== channel) throw new Error('Discord is no longer on the specified channel.');
   globalThis.stopMctiersQueue?.();
 
-  function joinComponentId(components) {
+  function joinComponent(components) {
     if (!Array.isArray(components)) return;
     for (const component of components) {
-      if (component.type === 2 && component.label === 'Join Queue' && !component.disabled) {
-        return component.custom_id ?? component.customId;
+      if (component.type === 2 && component.label === 'Join Queue') {
+        const customId = component.custom_id ?? component.customId;
+        if (typeof customId === 'string' && customId) {
+          return { customId, id: component.id ?? customId, disabled: Boolean(component.disabled) };
+        }
       }
       if (component.components) {
-        const nested = joinComponentId(component.components);
+        const nested = joinComponent(component.components);
         if (nested) return nested;
       }
     }
@@ -36,7 +41,7 @@ export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
       const message = fiber.memoizedProps?.message;
       if (message?.id === messageId) {
         const matches = message.author?.id === appId || message.applicationId === appId || message.application_id === appId;
-        const identity = { messageId, matches, componentId: matches && joinComponentId(message.components) };
+        const identity = { messageId, matches, message };
         identities.set(button, identity);
         return identity;
       }
@@ -63,7 +68,12 @@ export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
     const enabled = !button.disabled && button.getAttribute('aria-disabled') !== 'true';
     const count = row.textContent.match(countPattern);
     const full = count ? Number(count[1]) >= Number(count[2]) : undefined;
-    seen.set(messageId, { enabled, full, button, componentId: identity.componentId });
+    seen.set(messageId, { enabled, full });
+    if (baseline) {
+      const component = joinComponent(identity.message.components);
+      if (component) component.disabled ||= !enabled;
+      incoming.set(messageId, { full, component, flags: identity.message.flags ?? 0 });
+    }
     if (baseline) return { button, messageId, enabled, full, displayedCount: count?.[0].trim() };
     if (!enabled) return;
 
@@ -94,35 +104,35 @@ export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
   }
   if (tryVisible) return Promise.resolve({ outcome: 'no enabled button' });
 
-  function findDispatcher() {
-    const chunks = globalThis.webpackChunkdiscord_app;
-    if (!chunks || chunks.push === Array.prototype.push) return;
-    try {
-      let cache;
-      chunks.push([[`mctiers-queue-${Date.now()}`], {}, require => { cache = require.c; }]);
-      const isDispatcher = value => typeof value?.dispatch === 'function' &&
-        typeof value?.subscribe === 'function' && typeof value?.unsubscribe === 'function';
-      for (const module of Object.values(cache || {})) {
-        if (isDispatcher(module?.exports)) return module.exports;
-        for (const key of Object.keys(module?.exports || {})) {
-          const value = module.exports[key];
-          if (isDispatcher(value)) return value;
-        }
-      }
-    } catch {}
-  }
-
   return new Promise(resolve => {
     let active = true;
-    let dispatcher = findDispatcher();
+    let finished = false;
+    let transport;
+    try {
+      transport = resolveTransport?.();
+    } catch {}
+    const subscriptions = [
+      ['MESSAGE_CREATE', event => onMessage(event, true)],
+      ['MESSAGE_UPDATE', event => onMessage(event, false)]
+    ];
+
+    function unsubscribe() {
+      for (const [type, handler] of subscriptions) {
+        try {
+          transport?.dispatcher.unsubscribe(type, handler);
+        } catch {}
+      }
+    }
 
     function finish(result) {
+      if (finished) return;
+      finished = true;
       active = false;
       observer.disconnect();
       clearTimeout(timeout);
       delete globalThis.stopMctiersQueue;
       resolve(result);
-      if (dispatcher) queueMicrotask(() => dispatcher.unsubscribe('MESSAGE_UPDATE', onMessageUpdate));
+      if (transport) queueMicrotask(unsubscribe);
     }
 
     function attempt(button, messageId, displayedCount, observedAt, source) {
@@ -135,24 +145,56 @@ export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
       });
     }
 
-    function onMessageUpdate({ message } = {}) {
-      if (!active || !message || (message.channel_id ?? message.channelId) !== channelId) return;
-      const prior = seen.get(message.id);
-      if (!prior?.full || !prior.enabled || !prior.componentId || !prior.button.isConnected) return;
+    function onMessage({ message, isPushNotification } = {}, created) {
+      if (!active || isPushNotification || !message?.id || (message.channel_id ?? message.channelId) !== channelId) return;
+      const prior = incoming.get(message.id);
+      const application = message.application_id ?? message.applicationId ?? message.author?.id;
+      if (application == null ? !prior : application !== appId) return;
       const observedAt = performance.now();
-      if (message.components && joinComponentId(message.components) !== prior.componentId) return;
-      for (const embed of message.embeds || []) {
-        const count = (embed.rawDescription ?? embed.description)?.match(countPattern);
-        if (!count || Number(count[1]) >= Number(count[2])) continue;
-        queueMicrotask(() => {
-          const { button } = prior;
-          if (active && currentChannel() === channel && button.isConnected && !button.disabled &&
-              button.getAttribute('aria-disabled') !== 'true') {
-            attempt(button, message.id, count[0], observedAt, 'message update');
-          }
-        });
-        break;
+      const component = message.components === undefined ? prior?.component : joinComponent(message.components);
+      const flags = message.flags ?? prior?.flags ?? 0;
+      let full = prior?.full;
+      let count;
+      if (Array.isArray(message.embeds)) {
+        full = undefined;
+        for (const embed of message.embeds) {
+          count = (embed.rawDescription ?? embed.description)?.match(countPattern);
+          if (!count) continue;
+          full = Number(count[1]) >= Number(count[2]);
+          break;
+        }
       }
+      incoming.set(message.id, { component, flags, full });
+      if (!component || component.disabled) return;
+
+      const fresh = created && !prior;
+      const enabledNow = prior && (!prior.component || prior.component.disabled);
+      const slotShown = full === false && prior?.full !== false;
+      if (!fresh && !enabledNow && !slotShown) return;
+
+      active = false;
+      const result = {
+        outcome: live ? 'join attempted' : 'opening detected in preview',
+        messageId: message.id,
+        displayedCount: count ? `Queue (${count[1]}/${count[2]})` : undefined,
+        detectMs: performance.now() - observedAt,
+        source: 'incoming update'
+      };
+      if (!live) return finish(result);
+
+      observer.disconnect();
+      queueMicrotask(async () => {
+        if (finished) return;
+        try {
+          await transport.submit({
+            componentType: 2, messageId: message.id, messageFlags: flags,
+            customId: component.customId, componentId: component.id, applicationId: appId, channelId, guildId
+          });
+          finish(result);
+        } catch {
+          finish({ outcome: 'join request failed' });
+        }
+      });
     }
 
     const options = {
@@ -172,8 +214,13 @@ export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
     }
 
     const observer = new MutationObserver(records => {
+      if (!active) return;
       const observedAt = performance.now();
-      if (currentChannel() !== channel) return finish({ outcome: 'channel changed' });
+      if (currentChannel() !== channel) {
+        if (transport) observer.disconnect();
+        else finish({ outcome: 'channel changed' });
+        return;
+      }
       const visited = new Set();
 
       function tryRow(row) {
@@ -213,11 +260,12 @@ export function watchQueue({ channel, live, tryVisible = false, onWaiting }) {
     globalThis.stopMctiersQueue = () => finish({ outcome: 'stopped' });
     observe();
     try {
-      dispatcher?.subscribe('MESSAGE_UPDATE', onMessageUpdate);
+      for (const [type, handler] of subscriptions) transport?.dispatcher.subscribe(type, handler);
     } catch {
-      dispatcher = undefined;
+      unsubscribe();
+      transport = undefined;
     }
-    onWaiting?.(current);
+    onWaiting?.(current, Boolean(transport));
   });
 }
 
@@ -250,9 +298,15 @@ async function run() {
   });
 
   const live = options.includes('--live');
+  const watcher = `(() => {
+    const resolve = (${resolveDiscordTransport});
+    const watch = (${watchQueue});
+    let transport;
+    return options => watch({ ...options, resolveTransport: () => transport ??= resolve() });
+  })()`;
   const expression = panel
-    ? `(${showQueuePanel})(${watchQueue})`
-    : `(${watchQueue})(${JSON.stringify({ channel, live })})`;
+    ? `(${showQueuePanel})(${watcher})`
+    : `(${watcher})(${JSON.stringify({ channel, live })})`;
   const stop = () => socket.send(JSON.stringify({ id: 2, method: 'Runtime.evaluate', params: {
     expression: 'globalThis.stopMctiersQueue?.()'
   } }));
