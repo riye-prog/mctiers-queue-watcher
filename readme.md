@@ -22,13 +22,20 @@
    open -a /Applications/Discord.app --args --remote-debugging-port=9223
    ```
 
-   **Windows PowerShell** (quit from the system tray)
+   **Windows PowerShell** (quit from the system tray first, then run this block to stop any remaining Discord processes and relaunch)
 
    ```powershell
+   Get-Process -Name Discord -ErrorAction SilentlyContinue |
+     Stop-Process -Force -PassThru |
+     Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+   if (Get-Process -Name Discord -ErrorAction SilentlyContinue) {
+     throw 'Discord is still running. Quit it completely before relaunching.'
+   }
+
    $discord = Get-ChildItem "$env:LOCALAPPDATA\Discord\app-*\Discord.exe" -File |
      Sort-Object { [version]($_.Directory.Name -replace '^app-', '') } -Descending |
      Select-Object -First 1
-   Start-Process -FilePath $discord.FullName -ArgumentList '--remote-debugging-port=9223'
+   Start-Process -FilePath $discord.FullName -WorkingDirectory $discord.DirectoryName -ArgumentList '--remote-debugging-port=9223'
    ```
 
 3. Open your MCTiers queue channel in Discord, then load the panel.
